@@ -1,18 +1,18 @@
 from vllm import LLM, SamplingParams
-import drgrpo_grader as grader
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
+from unittest.mock import patch
 from pathlib import Path
 import json
 import re
-from statistics import mean, median
-from transformers import AutoTokenizer
+from transformers import AutoModelForCausalLM, PreTrainedModel
 from typing import Callable
+import torch
+import drgrpo_grader as grader
 
 
 
 
-
-
-prompts = Path("cs336_alignment/prompts/r1_zero.prompt").read_text(encoding="utf-8")
+prompts = Path("cs336_alignment/prompts/r1_zero_inference.prompt").read_text(encoding="utf-8")
 
 questions, answers, rendered_prompts, answers_pure = [], [], [], []
 
@@ -32,59 +32,50 @@ with open("data/gsm8k/test.jsonl", "r", encoding="utf-8") as f:
             # attach the empty string if no matches
             answers_pure.append("")
         rendered_prompts.append(prompts.format(question=example["question"]))
-        # if len(questions) >= 2:
-        #     break
-
-# print(questions)
-# print(answers)
-# print(rendered_prompts)
-# print(answers_pure)
-
-
-# TOKENIZER_NAME = "Qwen/Qwen2.5-Math-1.5B"
-
-# tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-
-# def count_tokens(s: str) -> int:
-#     # 不加 special tokens，只统计纯文本token
-#     return len(tokenizer.encode(s, add_special_tokens=False))
-
-# def prompt_length_stats_by_tokens(rendered_prompts: list[str]) -> dict:
-#     if not rendered_prompts:
-#         return {"count": 0, "min": 0, "median": 0, "mean": 0.0, "max": 0}
-
-#     lens = [count_tokens(s) for s in rendered_prompts]
-#     return {
-#         "count": len(lens),
-#         "min": min(lens),
-#         "median": int(median(lens)),
-#         "mean": float(mean(lens)),
-#         "max": max(lens)
-#     }
-
-
-# print(prompt_length_stats_by_tokens(rendered_prompts))
 
 
 
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+    vllm_set_random_seed(seed)
+
+    
+    ## 防止vllm环境报错
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+    profiling_patch = patch(
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        return_value=None
+    )
+
+    with world_size_patch, profiling_patch:
+        return LLM(
+        model=model_id,
+        device=device,
+        dtype=torch.bfloat16,
+        enable_prefix_caching=True,
+        gpu_memory_utilization=gpu_memory_utilization
+    )
 
 
+def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
+    state_dict = policy.state_dict()
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(state_dict.items())
 
-# # print(grader.grade(answers[0], answers_pure[0], fast=True))
+policy = AutoModelForCausalLM.from_pretrained("models/cot_sft_v1",
+                                            torch_dtype="bfloat16",
+                                            attn_implementation="flash_attention_2").to("cuda")
+llm = init_vllm("Qwen/Qwen2.5-Math-1.5B", "cuda", 99)
+load_policy_into_vllm_instance(policy, llm)
+
 
 
 sampling_params = SamplingParams(
     temperature=1.0,
     top_p=1.0,
-    max_tokens=1024,
+    max_tokens=1280,
     stop=["</answer>"],
     include_stop_str_in_output=True)
 
-
-llm = LLM(
-        model="Qwen/Qwen2.5-Math-1.5B",
-        dtype="bfloat16")
-        # max_num_batched_tokens=8000)
 
 
 def evaluate_vllm(
@@ -131,6 +122,3 @@ def evaluate_vllm(
 evaluate_vllm(llm, grader.r1_zero_reward_fn, rendered_prompts, sampling_params, answers_pure)
 
     
-    
-
-

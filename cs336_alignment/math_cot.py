@@ -10,6 +10,8 @@ ds = ds["train"]
 
 
 ds = ds.filter(lambda x: x["correct"] is True and int(x.get("generated_token_count", 0)) < 1024)
+# 暂时包含了不正确的答案
+# ds = ds.filter(lambda x: int(x.get("generated_token_count", 0)) < 1024)
 
 def replace_boxed(text: str) -> str:
     """
@@ -78,6 +80,7 @@ def to_sft(example):
 
 
 ds = ds.map(to_sft)
+ds = ds.filter(lambda x: x["conversations"][-1]["value"].count("</answer>") == 1)
 ds = ds.remove_columns(["source", "solution", "messages", "system"])
 
 

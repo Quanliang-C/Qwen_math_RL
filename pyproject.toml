@@ -7,7 +7,6 @@ requires-python = ">=3.11,<3.13"  # Python 3.13 not yet supported for some deps
 dependencies = [
     "accelerate>=1.5.2",
     "alpaca-eval",
-    "flash-attn==2.7.4.post1",
     "jupyter>=1.1.1",
     "math-verify[antlr4-13-2]>=0.7.0",
     "pylatexenc==2.10",
@@ -20,6 +19,7 @@ dependencies = [
     "vllm==0.7.2",
     "wandb>=0.19.8",
     "xopen>=2.0.2",
+    "flash-attn",
 ]
 
 [tool.setuptools.packages.find]
@@ -32,6 +32,7 @@ no-build-isolation-package = ["flash-attn"]
 
 [tool.uv.sources]
 alpaca-eval = { git = "https://github.com/nelson-liu/alpaca_eval.git", rev = "forward_kwargs_to_vllm" }
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1%2Bcu12torch2.5cxx11abiFALSE-cp312-cp312-linux_x86_64.whl" }
 
 [tool.pytest.ini_options]
 log_cli = true
