@@ -6,13 +6,13 @@ import re
 from statistics import mean, median
 from transformers import AutoTokenizer
 from typing import Callable
+from string import Template
 
 
 
 
 
-
-prompts = Path("cs336_alignment/prompts/r1_zero.prompt").read_text(encoding="utf-8")
+prompts = Template(Path("cs336_alignment/prompts/r1_zero_inference.prompt").read_text(encoding="utf-8"))
 
 questions, answers, rendered_prompts, answers_pure = [], [], [], []
 
@@ -31,7 +31,7 @@ with open("data/gsm8k/test.jsonl", "r", encoding="utf-8") as f:
         else:
             # attach the empty string if no matches
             answers_pure.append("")
-        rendered_prompts.append(prompts.format(question=example["question"]))
+        rendered_prompts.append(prompts.substitute(question=example["question"]))
         # if len(questions) >= 2:
         #     break
 

@@ -8,11 +8,12 @@ from transformers import AutoModelForCausalLM, PreTrainedModel
 from typing import Callable
 import torch
 import drgrpo_grader as grader
+from string import Template
 
 
 
 
-prompts = Path("cs336_alignment/prompts/r1_zero_inference.prompt").read_text(encoding="utf-8")
+prompts = Template(Path("cs336_alignment/prompts/r1_zero_inference.prompt").read_text(encoding="utf-8"))
 
 questions, answers, rendered_prompts, answers_pure = [], [], [], []
 
@@ -31,7 +32,7 @@ with open("data/gsm8k/test.jsonl", "r", encoding="utf-8") as f:
         else:
             # attach the empty string if no matches
             answers_pure.append("")
-        rendered_prompts.append(prompts.format(question=example["question"]))
+        rendered_prompts.append(prompts.substitute(question=example["question"]))
 
 
 
@@ -61,9 +62,10 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
 
-policy = AutoModelForCausalLM.from_pretrained("models/cot_sft_v1",
+## 不需要传到cuda, 浪费显存，只需要传入dict
+policy = AutoModelForCausalLM.from_pretrained("models/expert_2",
                                             torch_dtype="bfloat16",
-                                            attn_implementation="flash_attention_2").to("cuda")
+                                            attn_implementation="flash_attention_2")
 llm = init_vllm("Qwen/Qwen2.5-Math-1.5B", "cuda", 99)
 load_policy_into_vllm_instance(policy, llm)
 
@@ -112,11 +114,11 @@ def evaluate_vllm(
     print(f"Accuracy: {correct_count / len(prompts)}")
 
     ## write to a jsonl file
-    with open("outputs/zero_shot_metrics.jsonl", "w") as f:
+    with open("outputs/expert2_sft_metrics.jsonl", "w") as f:
         for metrics in all_metrics:
             f.write(json.dumps(metrics) + "\n")
-    print(f"Saved metrics to zero_shot_metrics.jsonl")
-    
+    print(f"Saved metrics to expert2_sft_metrics.jsonl")
+
 
 
 evaluate_vllm(llm, grader.r1_zero_reward_fn, rendered_prompts, sampling_params, answers_pure)
