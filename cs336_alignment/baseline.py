@@ -76,7 +76,7 @@ with open("data/gsm8k/test.jsonl", "r", encoding="utf-8") as f:
 sampling_params = SamplingParams(
     temperature=1.0,
     top_p=1.0,
-    max_tokens=1024,
+    max_tokens=512,
     stop=["</answer>"],
     include_stop_str_in_output=True)
 

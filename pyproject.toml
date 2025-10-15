@@ -20,6 +20,7 @@ dependencies = [
     "wandb>=0.19.8",
     "xopen>=2.0.2",
     "flash-attn",
+    "datasets>=2.19,<3",
 ]
 
 [tool.setuptools.packages.find]
