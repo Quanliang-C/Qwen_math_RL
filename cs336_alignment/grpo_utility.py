@@ -235,7 +235,7 @@ def grpo_microbatch_train_step(
         tuple[torch.Tensor, dict[str, torch.Tensor]]: 
             the policy gradient loss and its metadata.
     """
-    batch_size = policy_log_probs.shape[0]
+    # batch_size = policy_log_probs.shape[0]
     loss, _ = compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
     loss = masked_mean(loss, response_mask)
     loss = loss / float(gradient_accumulation_steps)
@@ -307,6 +307,48 @@ def rollout_vllm(vllm: LLM, prompts: list[str], sampling_params: SamplingParams)
     return texts, log_probs, token_ids
 
 
+def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
+    """Get the entropy of the logits (i.e., entropy of the final dimension)."""
+    return -(torch.softmax(logits, dim=-1) * torch.log_softmax(logits, dim=-1)).sum(dim=-1)
+
+def get_response_log_probs(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    return_token_entropy: bool,
+    attn_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Get the conditional log-probs of the response given the prompt,
+        and optionally the entropy of the next token predictions.
+
+    Args:
+        model: PreTrainedModel, the model to score.
+        input_ids: torch.Tensor of shape (batch_size, sequence_length):
+            the tokenized prompt and output.
+        labels: torch.Tensor of shape (batch_size, sequence_length):
+            shifted input_ids.
+        return_token_entropy: bool, whether to return the entropy of the
+            next token predictions.
+
+    Returns:
+        dict[str, torch.Tensor]:
+            "log_probs": torch.Tensor of shape (batch_size, sequence_length):
+                the conditional log-probs of the response given the prompt.
+                Note that we have not masked out the token indices corresponding
+                to the prompt or padding; that is done in the train loop.
+            "token_entropy": Optional[torch.Tensor] of shape (batch_size, sequence_length):
+                the entropy of the next token predictions. As with the log-probs,
+                we have not masked out the token indices corresponding to the prompt
+                or padding; that is done in the train loop.
+    """
+    logits = model(input_ids, attention_mask=attn_mask).logits[:, :-1, :]
+    log_prob = torch.log_softmax(logits, dim=-1)
+    log_prob = log_prob.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+    if return_token_entropy:
+        token_entropy = compute_entropy(logits)
+        return {"log_probs": log_prob, "token_entropy": token_entropy}
+    else:
+        return {"log_probs": log_prob}
 
 
 ## 需要修改

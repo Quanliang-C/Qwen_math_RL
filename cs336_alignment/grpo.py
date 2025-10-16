@@ -11,7 +11,7 @@ from vllm import LLM, SamplingParams
 # from sft_evaluate import init_vllm, load_policy_into_vllm_instance, evaluate_vllm
 from torch.utils.data import DataLoader
 from drgrpo_grader import r1_zero_reward_fn
-
+import gc
 
 import time
 
@@ -116,52 +116,102 @@ def main():
             load_policy_into_vllm_instance(policy, llm)
         
         ## 现在rollout, 8 prompts得到8*8=64个response
-        texts, log_probs, token_ids = rollout_vllm(llm, prompts, sampling_params)
+        texts, old_log_probs, token_ids = rollout_vllm(llm, prompts, sampling_params)
+        # print("first old_log_probs length", len(old_log_probs[0]))
+        # old_log_probs = old_log_probs[0][0].get(token_ids[0][0])
+        # print("old_log_probs", old_log_probs)
+        # old_log_probs = [ for x, y in zip(old_log_probs, token_ids)]
+        expanded_old_log_probs = []
+        for step_logprobs, step_token_ids in zip(old_log_probs, token_ids):
+            seq_log_probs = []
+            for per_step_dict, tid in zip(step_logprobs, step_token_ids):
+                if per_step_dict is None:
+                    seq_log_probs.append(None)            # prompt 部分可能是 None
+                else:
+                    seq_log_probs.append(per_step_dict[tid].logprob)
+            expanded_old_log_probs.append(seq_log_probs)
+
+        old_log_probs = expanded_old_log_probs
+        print("first old_log_probs length", len(old_log_probs[0]))
+        print("first old_log_probs", old_log_probs[0])
+        print("len of old log probs", len(old_log_probs))
+        # print("old_log_probs", old_log_probs)
+        
+
+
+        response_len = [len(x) for x in texts]
+        print("response_len", response_len)
+        log_probs_len = [len(x) for x in old_log_probs]
+        print("log_probs_len", log_probs_len)
+        token_ids_len = [len(x) for x in token_ids]
+        print("token_ids_len", token_ids_len)
+        exit()
+
+
+
+
+
         correct_count = 0
         all_metrics = []
         answers_repeated = [x for x in answers_pure for _ in range(group_size)]
-        for i, (prompt, response, ground_truth) in enumerate(zip(prompts, texts, answers_repeated), start=1):
-            metrics = r1_zero_reward_fn(response, ground_truth)
-            metrics["index"] = i
-            correct_count += metrics["answer_reward"]
-            all_metrics.append(metrics)
+        prompt_repeated = [x for x in prompts for _ in range(group_size)]
+        advantage, raw_reward, _ = compute_group_normalized_rewards(r1_zero_reward_fn, texts, answers_repeated, group_size, advantage_eps, use_std_normalization)
+        prompt_and_response = [x + y for x, y in zip(prompt_repeated, texts)]
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B")
+        tokenizer.padding_side = "left"
+        prompt_and_response_token_ids = tokenizer(
+            prompt_and_response,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        print(f"Correct count: {correct_count}")
-        print(f"Accuracy: {correct_count / len(texts)}")
-        print("length of texts is: ")
-        print(len(texts))
-        print("length of prompts is: ")
-        print(len(prompts))
-        print("length of answers_pure is: ")
-        print(len(answers_pure))
-        print("length of answers_repeated is: ")
-        print(len(answers_repeated))
-        print("reard is :")
-        print(all_metrics)
-        print("-"*100)
-        print("texts is: ")
-        print(texts[0:8])
-        print("-"*100)
-        print("answers_pure is: ")
-        print(answers_pure[0])
-        print("-"*100)
-        print("log_probs is: ")
-        print(log_probs[0])
-        print("-"*100)
-        print("token_ids is: ")
-        print(token_ids[0])
-        print("-"*100)
+
+        input_ids = prompt_and_response_token_ids["input_ids"].to("cuda")
+        attention_mask = prompt_and_response_token_ids["attention_mask"].to("cuda")
+        # attention_mask = attention_mask[:, 1:]
+        labels = input_ids[:, 1:].to("cuda")
+        print("input_ids in", input_ids.device)
+        print("attention_mask in", attention_mask.device)
+        print("input_ids shape", input_ids.shape)
+        print("attention_mask shape", attention_mask.shape)
+        print("labels in", labels.device)
+        print("labels shape", labels.shape)
+
+        
+        # new_log_probs = get_response_log_probs(policy, input_ids, labels, return_token_entropy=False, attn_mask=attention_mask)
+        # print("new_log_probs in", new_log_probs.device)
+        # print("new_log_probs shape", new_log_probs.shape)
+        
+        policy.to("cuda")
+        for i in range(epoch_per_rollout_batch):
+            for j in range(0, rollout_batch_size, micro_train_batch_size):
+                new_log_probs = get_response_log_probs(policy, input_ids[j:j+micro_train_batch_size, :], labels[j:j+micro_train_batch_size, :], return_token_entropy=False, attn_mask=attention_mask[j:j+micro_train_batch_size, :])["log_probs"]
+                print("new_log_probs in", new_log_probs.device)
+                print("new_log_probs shape", new_log_probs.shape)
+                print("-"*100)
+                print("after get_response_log_probs:")
+                print("input_ids in", input_ids.device)
+                print("attention_mask in", attention_mask[j:j+micro_train_batch_size, :].device)
+                print("input_ids shape", input_ids[j:j+micro_train_batch_size, :].shape)
+                print("attention_mask shape", attention_mask[j:j+micro_train_batch_size, :].shape)
+                print("labels in", labels[j:j+micro_train_batch_size, :].device)
+                print("labels shape", labels[j:j+micro_train_batch_size, :].shape)
+
+                print("-"*100)
+                exit()
+                
+
+
+
         time_end = time.time()
         print(f"Time taken: {time_end - time_start} seconds")
         exit()
 
-        answers_repeated = [x for x in answers_pure for _ in range(group_size)]
-        # reponse_list_by_group = [raw_responses[i:i+group_size] for i in range(0, len(raw_responses), group_size)]
-        ## 32
-        for i in range(gradient_accumulation_steps):
-            advantages, _, _ = compute_group_normalized_rewards(r1_zero_reward_fn, outputs, answers_repeated, group_size, advantage_eps, use_std_normalization)
-            
-            
             
 
         
