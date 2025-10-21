@@ -7,7 +7,7 @@ from string import Template
 
 
 
-def evaluate(LLM: LLM, model_name: str, reward_fn: Callable[[str, str], dict[str, float]]):
+def evaluate(LLM: LLM, model_name: str, reward_fn: Callable[[str, str], dict[str, float]], max_tokens: int = 512):
 
     ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,7 +19,7 @@ def evaluate(LLM: LLM, model_name: str, reward_fn: Callable[[str, str], dict[str
     sampling_params = SamplingParams(
     temperature=1.0,
     top_p=1.0,
-    max_tokens=512,
+    max_tokens=max_tokens,
     min_tokens=4,
     stop=["</answer>"],
     include_stop_str_in_output=True)

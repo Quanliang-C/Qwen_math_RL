@@ -19,10 +19,10 @@ import grpo_evaluate as grpo_evaluate
 from torch.nn.utils.rnn import pad_sequence
 
 import wandb
-import bitsandbytes as bnb
+# import bitsandbytes as bnb
 
-
-
+#下载本地参数
+# huggingface-cli download Qwen/Qwen2.5-Math-1.5B --revision main
 
 
 
@@ -36,14 +36,14 @@ n_grpo_steps = 200
 learning_rate = 1e-5
 advantage_eps = 1e-8
 sampling_min_tokens = 4
-sampling_max_tokens = 512
+sampling_max_tokens = 768
 epoch_per_rollout_batch = 1
-train_batch_size = 64
-rollout_batch_size = 64
+train_batch_size = 512
+rollout_batch_size = 512
 gradient_accumulation_steps = 64
 gpu_memory_utilization = 0.80
 loss_type = "reinforce_with_baseline"
-group_size = 8
+group_size = 16
 
 ## 目前的逻辑是这样的，仅为暂时的
 num_optimizer_steps = n_grpo_steps * epoch_per_rollout_batch
@@ -79,22 +79,22 @@ def main():
     assert train_batch_size % gradient_accumulation_steps == 0, (
         "train_batch_size must be divisible by gradient_accumulation_steps"
     )
-    ## 64/ 64 = 1
+    ## 512/ 128 = 4
     micro_train_batch_size = train_batch_size // gradient_accumulation_steps
-    ## 64 % 8 == 0
+    ## 512 % 16 == 0
     assert rollout_batch_size % group_size == 0, (
         "rollout_batch_size must be divisible by group_size"
     )
-    ## 64/ 8 = 8
+    ## 512/ 16 = 32
     n_prompt_per_rollout_batch = rollout_batch_size // group_size
 
-    ## 64 >= 8
+    ## 512 >= 16
     assert train_batch_size >= group_size, (
         "train_batch_size must be greater than or equal to group_size"
     )
 
-    ## 64 / 1 == 64
-    n_micro_batches_per_epoch = rollout_batch_size // micro_train_batch_size
+    ## 512 / 4 == 128
+    # n_micro_batches_per_epoch = rollout_batch_size // micro_train_batch_size
 
     wandb.define_metric("train_step")
     wandb.define_metric("raw_reward/*", step_metric="train_step")
@@ -124,7 +124,7 @@ def main():
         dataset,
         batch_size=n_prompt_per_rollout_batch,
         shuffle=True,
-        num_workers=8,
+        num_workers=24,
         pin_memory=True,
         persistent_workers=True
     )
@@ -144,12 +144,14 @@ def main():
                 LOCAL_SNAPSHOT,
                 torch_dtype="bfloat16",
                 attn_implementation="flash_attention_2"
-            )
-            optimizer = bnb.optim.PagedAdamW8bit(
-                params=policy.parameters(),
+            ).to("cuda")
+            optimizer = torch.optim.AdamW(
+                policy.parameters(),
                 lr=learning_rate,
                 betas=(0.9, 0.95),
-                weight_decay=0.0)
+                weight_decay=0.0,
+                fused=True
+            )
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer=optimizer,
                 num_warmup_steps=50,
@@ -157,10 +159,14 @@ def main():
             )
             llm = init_vllm(LOCAL_SNAPSHOT, "cuda", 99, gpu_memory_utilization=gpu_memory_utilization)
             load_policy_into_vllm_instance(policy, llm)
-            wandb.watch(policy, log="gradients", log_freq=20)
+            wandb.watch(policy, log="gradients", log_freq=40)
+        elif train_step % 10 == 0:
+            ## vllm loaded when evaluating, do not need to load again
+            pass
         else:
-            ## policy still on cpu
-            llm = init_vllm(LOCAL_SNAPSHOT, "cuda", 99, gpu_memory_utilization=gpu_memory_utilization)
+            ## policy still on cuda for h200
+            ## keep llm
+            # llm = init_vllm(LOCAL_SNAPSHOT, "cuda", 99, gpu_memory_utilization=gpu_memory_utilization)
             load_policy_into_vllm_instance(policy, llm)
 
 
@@ -190,9 +196,9 @@ def main():
             return_tensors="pt",
             return_attention_mask=True,
         )
-        del llm
-        gc.collect()
-        torch.cuda.empty_cache()
+        # del llm
+        # gc.collect()
+        # torch.cuda.empty_cache()
 
         input_ids = prompt_and_response_token_ids["input_ids"].to("cuda")
         attention_mask = prompt_and_response_token_ids["attention_mask"].to("cuda")
@@ -201,7 +207,7 @@ def main():
 
 
 
-        policy.to("cuda")
+        # policy.to("cuda")
         
         gradient_accumulation_count = 0
         # optimizer = torch.optim.Adam(policy.parameters(),
@@ -278,17 +284,16 @@ def main():
             print("model saved in grpo step:", train_step)
         if (train_step+1) % 10 == 0:
             print("evaluating model in grpo step:", train_step)
-            policy.to("cpu")
-            del input_ids, attention_mask, labels
-            del prompt_and_response_token_ids
-            del advantage, raw_reward, expanded_old_log_probs
-            del texts, answers_repeated, prompt_repeated, prompt_and_response
-            # del optimizer
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-            llm = init_vllm(LOCAL_SNAPSHOT, "cuda", 99, gpu_memory_utilization=gpu_memory_utilization)
+            # policy.to("cpu")
+            # del input_ids, attention_mask, labels
+            # del prompt_and_response_token_ids
+            # del advantage, raw_reward, expanded_old_log_probs
+            # del texts, answers_repeated, prompt_repeated, prompt_and_response
+            # # del optimizer
+            # gc.collect()
+            # if torch.cuda.is_available():
+            #     torch.cuda.empty_cache()
+            # llm = init_vllm(LOCAL_SNAPSHOT, "cuda", 99, gpu_memory_utilization=gpu_memory_utilization)
             load_policy_into_vllm_instance(policy, llm)
             correct_count, accuracy = grpo_evaluate.evaluate(llm, f"grpo_{loss_type}_{model_version}_{train_step+1}", r1_zero_reward_fn, max_tokens=sampling_max_tokens)
             wandb.log({
@@ -297,26 +302,24 @@ def main():
                 "eval_metrics/correct_count": correct_count,
                 "total_loss": total_loss
             }, commit=False)
-            del llm
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+            # del llm
+            # gc.collect()
+            # if torch.cuda.is_available():
+            #     torch.cuda.empty_cache()
         else:
-            policy.to("cpu")
+            # policy.to("cpu")
         ## free gpu memory here
-            del input_ids, attention_mask, labels
-            del prompt_and_response_token_ids
-            del advantage, raw_reward, expanded_old_log_probs
-            del texts, answers_repeated, prompt_repeated, prompt_and_response
+            # del input_ids, attention_mask, labels
+            # del prompt_and_response_token_ids
+            # del advantage, raw_reward, expanded_old_log_probs
+            # del texts, answers_repeated, prompt_repeated, prompt_and_response
             # del optimizer
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+            # gc.collect()
+            # if torch.cuda.is_available():
+            #     torch.cuda.empty_cache()
+            pass
                 
             
-
 
 if __name__ == "__main__":
     main()

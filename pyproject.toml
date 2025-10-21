@@ -21,6 +21,7 @@ dependencies = [
     "xopen>=2.0.2",
     "flash-attn",
     "datasets>=2.19,<3",
+    "bitsandbytes>=0.48.1",
 ]
 
 [tool.setuptools.packages.find]
