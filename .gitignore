@@ -1,3 +1,7 @@
+outputs/
+wandb/
+grpo_checkpoint/
+
 *.bin
 models/
 data/

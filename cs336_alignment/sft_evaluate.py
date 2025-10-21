@@ -9,15 +9,17 @@ from typing import Callable
 import torch
 import drgrpo_grader as grader
 from string import Template
+import time
 
+ROOT = Path(__file__).resolve().parents[1]
 
+template_path = ROOT / "cs336_alignment" / "prompts" / "r1_zero_inference.prompt"
 
-
-prompts = Template(Path("cs336_alignment/prompts/r1_zero_inference.prompt").read_text(encoding="utf-8"))
+prompts = Template(template_path.read_text(encoding="utf-8"))
 
 questions, answers, rendered_prompts, answers_pure = [], [], [], []
 
-with open("data/gsm8k/test.jsonl", "r", encoding="utf-8") as f:
+with open(ROOT / "data" / "gsm8k" / "test.jsonl", "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
         if not line:
@@ -25,7 +27,10 @@ with open("data/gsm8k/test.jsonl", "r", encoding="utf-8") as f:
         example = json.loads(line)
         questions.append(example["question"])
         answers.append(example["answer"])
+
         matches = re.findall(r"####\s*([^\n]+)", answers[-1])
+
+
         if matches:
             matches = matches[0].strip()
             answers_pure.append(matches)
@@ -33,7 +38,6 @@ with open("data/gsm8k/test.jsonl", "r", encoding="utf-8") as f:
             # attach the empty string if no matches
             answers_pure.append("")
         rendered_prompts.append(prompts.substitute(question=example["question"]))
-
 
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):

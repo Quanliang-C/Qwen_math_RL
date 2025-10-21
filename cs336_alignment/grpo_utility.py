@@ -351,6 +351,36 @@ def get_response_log_probs(
         return {"log_probs": log_prob}
 
 
+
+def get_response_log_probs_tensor_and_response_mask(
+    new_log_probs: torch.Tensor,
+    expanded_old_log_probs: list[list[float]]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    log_probs_len = [len(x) for x in expanded_old_log_probs]
+    response_len = log_probs_len
+    max_response_len = max(response_len)
+
+
+    old_log_probs_tensor = torch.zeros(
+        len(expanded_old_log_probs),
+        max_response_len,
+        dtype=torch.bfloat16,
+        device="cuda"
+    )
+
+    response_mask = torch.zeros_like(old_log_probs_tensor, dtype=torch.bfloat16, device="cuda")
+    
+
+    for i, (seq, resp_len) in enumerate(zip(expanded_old_log_probs, response_len)):
+        old_log_probs_tensor[i, -resp_len:] = torch.tensor(seq, dtype=torch.bfloat16, device="cuda")
+        response_mask[i, -resp_len:] = 1.0
+    
+    new_lpg_probs_resp = torch.zeros_like(old_log_probs_tensor)
+    for i, resp_len in enumerate(response_len):
+        new_lpg_probs_resp[i, -resp_len:] = new_log_probs[i, -resp_len:]
+    
+    return old_log_probs_tensor, response_mask, new_lpg_probs_resp
+
 ## 需要修改
 def evaluate_vllm(
     vllm_model: LLM,
