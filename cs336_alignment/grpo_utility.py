@@ -1,6 +1,6 @@
 import os
 from typing import Any, Callable, Literal
-
+import math
 from huggingface_hub.inference._generated.types.text_to_speech import TextToSpeechEarlyStoppingEnum
 import torch
 from torch import Tensor
@@ -15,6 +15,12 @@ from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from unittest.mock import patch
 from transformers import AutoModelForCausalLM, PreTrainedModel
+
+import random
+import numpy as np
+from torch.utils.data import DataLoader
+from torch.utils.data import RandomSampler
+
 
 def compute_group_normalized_rewards(
     reward_fn: Callable,
@@ -87,6 +93,11 @@ def compute_group_normalized_rewards(
             if normalize_by_std:
                 std_reward = std_reward_per_group[batch_index]
             batch_index += 1
+        ## 对于难题的加权处理
+        if math.isclose(x, 1.0) and average_reward < 0.16:
+            x = x * 2.0
+        elif math.isclose(x, 1.0) and average_reward < 0.26:
+            x = x * 1.5
         if normalize_by_std:
             advantage[i] = (x - average_reward) / (std_reward + advantage_eps)
         else:
@@ -354,8 +365,9 @@ def get_response_log_probs(
 
 def get_response_log_probs_tensor_and_response_mask(
     new_log_probs: torch.Tensor,
-    expanded_old_log_probs: list[list[float]]
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    expanded_old_log_probs: list[list[float]],
+    token_entropy: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     log_probs_len = [len(x) for x in expanded_old_log_probs]
     response_len = log_probs_len
     max_response_len = max(response_len)
@@ -379,45 +391,60 @@ def get_response_log_probs_tensor_and_response_mask(
     for i, resp_len in enumerate(response_len):
         new_lpg_probs_resp[i, -resp_len:] = new_log_probs[i, -resp_len:]
     
-    return old_log_probs_tensor, response_mask, new_lpg_probs_resp
+    token_entropy_resp = torch.zeros_like(old_log_probs_tensor)
+    for i, resp_len in enumerate(response_len):
+        token_entropy_resp[i, -resp_len:] = token_entropy[i, -resp_len:]
+    masked_entropy = (token_entropy_resp * response_mask).sum() / response_mask.sum().clamp_min(1e-8)
+        
+    return old_log_probs_tensor, response_mask, new_lpg_probs_resp, masked_entropy
 
-## 需要修改
-def evaluate_vllm(
-    vllm_model: LLM,
-    reward_fn: Callable[[str, str], dict[str, float]],
-    prompts: list[str],
-    eval_sampling_params: SamplingParams,
-    ground_truths: list[str]
-) -> None:
-    """
-    Evaluate a language model on a list of prompts,
-    compute evaluation metrics, and serialize results to disk.
-    """
-    raw_responses = vllm_model.generate(prompts, eval_sampling_params)
-    responses = []
 
-    for line in raw_responses:
-        response = line.outputs[0].text.strip()
-        responses.append(response)
 
-    all_metrics = []
-    correct_count = 0
-    
-    for i, (prompt, response, ground_truth) in enumerate(zip(prompts, responses, ground_truths), start=1):
+def save_checkpoint(output_dir: str, policy: PreTrainedModel, optimizer: torch.optim.Optimizer, scheduler, train_step: int, optimizer_step: int):
+    os.makedirs(output_dir, exist_ok=True)
+    policy.save_pretrained(output_dir)
+    torch.save(
+        {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler else None,
+            "train_step": train_step,
+            "optimizer_step": optimizer_step,
+            "rng": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch_cpu": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all()
+            }
+        },
+        os.path.join(output_dir, "trainer_state.pt")
+    )
 
-        metrics = reward_fn(response, ground_truth)
-        metrics["index"] = i
-        correct_count += metrics["answer_reward"]
-        metrics["prompt"] = prompt
-        metrics["response"] = response
-        metrics["ground_truth"] = ground_truth
-        all_metrics.append(metrics)
 
-    print(f"Correct count: {correct_count}")
-    print(f"Accuracy: {correct_count / len(prompts)}")
 
-    ## write to a jsonl file
-    with open("outputs/expert2_sft_metrics.jsonl", "w") as f:
-        for metrics in all_metrics:
-            f.write(json.dumps(metrics) + "\n")
-    print(f"Saved metrics to expert2_sft_metrics.jsonl")
+def load_trainer_state(ckpt_dir):
+    state = torch.load(os.path.join(ckpt_dir, "trainer_state.pt"), map_location="cpu")
+    return state
+
+def build_scheduler(optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int, lr_min: float):
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1, end_factor=1.0,
+        total_iters=warmup_steps
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps,
+        eta_min=lr_min
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps]
+    )
+
+def build_dataloader(dataset, batch_size):
+    gen = torch.Generator()
+    gen.manual_seed(2025)                     # 固定种子
+    sampler = RandomSampler(dataset, generator=gen)
+    return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                      num_workers=24, pin_memory=True, persistent_workers=True)
