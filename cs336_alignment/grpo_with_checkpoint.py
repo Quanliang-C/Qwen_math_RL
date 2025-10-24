@@ -21,9 +21,7 @@ import random
 import wandb
 import bitsandbytes as bnb
 from itertools import islice
-
-
-
+from collections import deque
 
 
 
@@ -35,29 +33,29 @@ LOCAL_SNAPSHOT = snapshot_download(
 )
 
 n_grpo_steps = 300
-learning_rate = 5e-5
+learning_rate = 4e-5
 warmup_steps = 10
-lr_min = 3e-5
+lr_min = 2e-5
 advantage_eps = 1e-6
 sampling_min_tokens = 0
 sampling_max_tokens = 512
-epoch_per_rollout_batch = 1
+epoch_per_rollout_batch = 3
 train_batch_size = 64
 rollout_batch_size = 64
-gradient_accumulation_steps = 64
+gradient_accumulation_steps = 32
 gpu_memory_utilization = 0.80
-loss_type = "reinforce_with_baseline"
+loss_type = "grpo_clip"
 group_size = 8
 
 ## 目前的逻辑是这样的，仅为暂时的
 num_optimizer_steps = n_grpo_steps * epoch_per_rollout_batch
 
-model_version = "v5"
+model_version = "v4_L4_tried4"
 
 
 use_std_normalization = False
 
-grpo_clip_range = 0.05
+grpo_clip_range = 0.20
 
 ### 断点需要注意,id, 模型，优化器，lr scheduler等都要一致, 要设置start_train_step, 现在暂时是错误的
 start_train_step = 1
@@ -80,7 +78,8 @@ if Load_From_Checkpoint:
         "use_std_normalization": use_std_normalization,
         "learning_rate": learning_rate,
         "grpo_clip_range": grpo_clip_range
-    })
+    }, 
+    tags=["fixed_mask_mean"])
 else:
     wandb.init(
     project="grpo",
@@ -96,27 +95,37 @@ else:
         "use_std_normalization": use_std_normalization,
         "learning_rate": learning_rate,
         "grpo_clip_range": grpo_clip_range
-    },
-    tags=["manually_weighted"])
+    }, 
+    tags=["fixed_mask_mean"])
+wandb.log({}, commit=True)
+
+
+
 
 def main():
+    random.seed(88)
+    np.random.seed(88)
+    torch.manual_seed(88)
+    torch.cuda.manual_seed_all(88)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     ## 64 % 64 == 0
-    assert train_batch_size % gradient_accumulation_steps == 0, (
-        "train_batch_size must be divisible by gradient_accumulation_steps"
-    )
+    # assert train_batch_size % gradient_accumulation_steps == 0, (
+    #     "train_batch_size must be divisible by gradient_accumulation_steps"
+    # )
     ## 64/ 64 = 1
     micro_train_batch_size = train_batch_size // gradient_accumulation_steps
     ## 64 % 8 == 0
-    assert rollout_batch_size % group_size == 0, (
-        "rollout_batch_size must be divisible by group_size"
-    )
+    # assert rollout_batch_size % group_size == 0, (
+    #     "rollout_batch_size must be divisible by group_size"
+    # )
     ## 64/ 8 = 8
     n_prompt_per_rollout_batch = rollout_batch_size // group_size
 
     ## 64 >= 8
-    assert train_batch_size >= group_size, (
-        "train_batch_size must be greater than or equal to group_size"
-    )
+    # assert train_batch_size >= group_size, (
+    #     "train_batch_size must be greater than or equal to group_size"
+    # )
 
     ## 64 / 1 == 64
     n_micro_batches_per_epoch = rollout_batch_size // micro_train_batch_size
@@ -140,7 +149,7 @@ def main():
         include_stop_str_in_output=True,
         n=group_size,
         seed=99,
-        logprobs=1
+        # logprobs=1
     )
 
     prompts, answers_pure = get_gsm8k_train_ready_prompts()
@@ -150,7 +159,7 @@ def main():
 
     dataloader = build_dataloader(dataset, n_prompt_per_rollout_batch)
     dataloader_iter = iter(dataloader)
-    skip = start_train_step % len(dataloader)
+    skip = (start_train_step-1) % len(dataloader)
     dataloader_iter = islice(dataloader_iter, skip, None)
     batch = next(dataloader_iter)
 
@@ -211,13 +220,13 @@ def main():
             load_policy_into_vllm_instance(policy, llm)
 
 
-        texts, old_log_probs, token_ids = rollout_vllm(llm, prompts, sampling_params)
-        expanded_old_log_probs = []
-        for step_logprobs, step_token_ids in zip(old_log_probs, token_ids):
-            seq_log_probs = []
-            for per_step_dict, tid in zip(step_logprobs, step_token_ids):
-                    seq_log_probs.append(per_step_dict[tid].logprob)
-            expanded_old_log_probs.append(seq_log_probs)
+        texts, token_ids = rollout_vllm(llm, prompts, sampling_params)
+        # expanded_old_log_probs = []
+        # for step_logprobs, step_token_ids in zip(old_log_probs, token_ids):
+        #     seq_log_probs = []
+        #     for per_step_dict, tid in zip(step_logprobs, step_token_ids):
+        #             seq_log_probs.append(per_step_dict[tid].logprob)
+        #     expanded_old_log_probs.append(seq_log_probs)
 
         len_token_ids = [len(x) for x in token_ids]
         max_token_len = max(len_token_ids)
@@ -263,6 +272,8 @@ def main():
         
         gradient_accumulation_count = 0
 
+        old_log_probs_list = []
+
         for i in range(epoch_per_rollout_batch):
             non_zero_loss_count = 0
             mean_token_entropy = 0.0
@@ -273,18 +284,21 @@ def main():
                 advantages_this_batch = advantage[j:j+micro_train_batch_size].to("cuda")
                 if advantages_this_batch.abs().max() < 0.0001:
                     # print(f"skip in grpo step {train_step} batch {i} micro batch {j}")
+                    old_log_probs_list.append(None)
                     if gradient_accumulation_count == gradient_accumulation_steps:
                         optimizer_step += 1
                         print(f"optimizer step {optimizer_step}")
+                        if non_zero_loss_count != 0:
+                            scheduler.step()
                         optimizer.step()
-                        scheduler.step()
+
                         wandb.log({
                             "optimizer_step": optimizer_step,
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/non_zero_loss_count": non_zero_loss_count,
                             "train/loss_mean": (total_loss / non_zero_loss_count) if non_zero_loss_count != 0 else 0,
                             "train/mean_token_entropy": mean_token_entropy / non_zero_loss_count if non_zero_loss_count != 0 else 0
-                        }, commit=False)
+                        }, commit=True)
                         optimizer.zero_grad(set_to_none=True)
                         gradient_accumulation_count = 0
                     continue
@@ -295,12 +309,24 @@ def main():
                 out = get_response_log_probs(policy, input_ids[j:j+micro_train_batch_size, :], labels[j:j+micro_train_batch_size, :], return_token_entropy=True, attn_mask=attention_mask[j:j+micro_train_batch_size, :])
                 new_log_probs = out["log_probs"]
                 entropy = out["token_entropy"]
-                old_log_probs_this_batch = expanded_old_log_probs[j:j+micro_train_batch_size]
+                # old_log_probs_this_batch = expanded_old_log_probs[j:j+micro_train_batch_size]
 
 
-                old_log_probs_tensor, response_mask, new_lpg_probs_resp, masked_token_entropy = get_response_log_probs_tensor_and_response_mask(new_log_probs, old_log_probs_this_batch, entropy)
+                response_lengths = len_token_ids[j:j+micro_train_batch_size]
+                
+
+
+                response_mask, new_lpg_probs_resp, masked_token_entropy = get_response_log_probs_tensor_and_response_mask(
+                    new_log_probs,
+                    response_lengths,
+                    entropy
+                )
                 mean_token_entropy += masked_token_entropy.item()
 
+                if loss_type == "grpo_clip" and i == 0:
+                    old_log_probs_list.append(new_lpg_probs_resp.detach().clone())
+                elif loss_type == "grpo_clip" and i != 0:
+                    old_log_probs_tensor = old_log_probs_list[j//micro_train_batch_size]
 
 
                 if loss_type == "no_baseline":
@@ -308,7 +334,12 @@ def main():
                 elif loss_type == "reinforce_with_baseline":
                     loss, _ = grpo_microbatch_train_step(new_lpg_probs_resp, response_mask, gradient_accumulation_steps, loss_type, advantages=advantages_this_batch)
                 elif loss_type == "grpo_clip":
-                    loss, _ = grpo_microbatch_train_step(new_lpg_probs_resp, response_mask, gradient_accumulation_steps, loss_type, advantages=advantages_this_batch, old_log_probs=old_log_probs_tensor, cliprange=grpo_clip_range)
+                    if i == 0:
+                        ## 第一轮，理论上退化成REINFORCE with baseline.
+                        loss, _ = grpo_microbatch_train_step(new_lpg_probs_resp, response_mask, gradient_accumulation_steps, "reinforce_with_baseline", advantages=advantages_this_batch)
+                    else:
+                        loss, _ = grpo_microbatch_train_step(new_lpg_probs_resp, response_mask, gradient_accumulation_steps, loss_type, advantages=advantages_this_batch, old_log_probs=old_log_probs_tensor, cliprange=grpo_clip_range)
+
                 # print(f"loss in grpo step {train_step} batch {i} micro batch {j}", loss)
                 # print("-"*100)
                 total_loss += loss.detach().mean().item()
@@ -324,7 +355,7 @@ def main():
                         "train/non_zero_loss_count": non_zero_loss_count,
                         "train/loss_mean": (total_loss / non_zero_loss_count) if non_zero_loss_count != 0 else 0,
                         "train/mean_token_entropy": mean_token_entropy / non_zero_loss_count if non_zero_loss_count != 0 else 0
-                    }, commit=False)
+                    }, commit=True)
                     optimizer.zero_grad(set_to_none=True)
                     gradient_accumulation_count = 0
             print(f"non_zero_loss_count in grpo step {train_step}, epoch {i}:", non_zero_loss_count)
@@ -332,16 +363,16 @@ def main():
 
 
 
-        if (train_step) % 25 == 0:
+        if (train_step) % 30 == 0:
             policy.save_pretrained(f"grpo_checkpoint/{loss_type}/{model_version}_{train_step}")
             save_checkpoint(f"grpo_checkpoint/{loss_type}/{model_version}_{train_step}", policy, optimizer, scheduler, train_step, optimizer_step)
             print("model saved in grpo step:", train_step)
-        if (train_step) % 10 == 0:
+        if (train_step) % 3 == 0:
             print("evaluating model in grpo step:", train_step)
             policy.to("cpu")
             del input_ids, attention_mask, labels
             del prompt_and_response_token_ids
-            del advantage, raw_reward, expanded_old_log_probs
+            del advantage, raw_reward
             del texts, answers_repeated, prompt_repeated, prompt_and_response
             # del optimizer
             gc.collect()
@@ -365,7 +396,7 @@ def main():
         ## free gpu memory here
             del input_ids, attention_mask, labels
             del prompt_and_response_token_ids
-            del advantage, raw_reward, expanded_old_log_probs
+            del advantage, raw_reward
             del texts, answers_repeated, prompt_repeated, prompt_and_response
             # del optimizer
             gc.collect()

@@ -93,11 +93,11 @@ def compute_group_normalized_rewards(
             if normalize_by_std:
                 std_reward = std_reward_per_group[batch_index]
             batch_index += 1
-        ## 对于难题的加权处理
-        if math.isclose(x, 1.0) and average_reward < 0.16:
-            x = x * 2.0
-        elif math.isclose(x, 1.0) and average_reward < 0.26:
-            x = x * 1.5
+        # ## 对于难题的加权处理
+        # if math.isclose(x, 1.0) and average_reward < 0.16:
+        #     x = x * 2.0
+        # elif math.isclose(x, 1.0) and average_reward < 0.26:
+        #     x = x * 1.5
         if normalize_by_std:
             advantage[i] = (x - average_reward) / (std_reward + advantage_eps)
         else:
@@ -206,6 +206,7 @@ def masked_mean(tensor: torch.Tensor, mask: torch.Tensor, dim: int | None = None
     if dim is None:
         return (tensor * mask).sum() / mask.sum()
     else:
+        ## 下面这个才是按样本取平均!!
         return (tensor * mask).sum(dim=dim) / mask.sum(dim=dim)
 
 
@@ -248,7 +249,9 @@ def grpo_microbatch_train_step(
     """
     # batch_size = policy_log_probs.shape[0]
     loss, _ = compute_policy_gradient_loss(policy_log_probs, loss_type, raw_rewards, advantages, old_log_probs, cliprange)
-    loss = masked_mean(loss, response_mask)
+    loss = masked_mean(loss, response_mask, dim=-1)
+    ## 按样本平均
+    loss = loss.mean()
     loss = loss / float(gradient_accumulation_steps)
     loss.backward()
     return loss, {}
@@ -307,15 +310,15 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
 
 def rollout_vllm(vllm: LLM, prompts: list[str], sampling_params: SamplingParams) -> tuple[list[str], list[list[float]], list[list[int]]]:
     raw_responses = vllm.generate(prompts, sampling_params)
-    texts, log_probs, token_ids = [], [], []
+    texts, token_ids = [], []
     ## 外层为每条prompt的多个response
     for line in raw_responses:
         ## 内层为每条prompt的多个response
         for output in line.outputs:
             texts.append(output.text.strip())
-            log_probs.append(output.logprobs)
+            # log_probs.append(output.logprobs)
             token_ids.append(output.token_ids)
-    return texts, log_probs, token_ids
+    return texts, token_ids
 
 
 def compute_entropy(logits: torch.Tensor) -> torch.Tensor:
@@ -362,41 +365,55 @@ def get_response_log_probs(
         return {"log_probs": log_prob}
 
 
-
+## 已修改！！！
 def get_response_log_probs_tensor_and_response_mask(
     new_log_probs: torch.Tensor,
-    expanded_old_log_probs: list[list[float]],
-    token_entropy: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    log_probs_len = [len(x) for x in expanded_old_log_probs]
-    response_len = log_probs_len
-    max_response_len = max(response_len)
+    response_lengths: list[int],
+    token_entropy: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    if len(response_lengths) == 0:
+        empty = torch.zeros(0, 0, dtype=torch.bfloat16, device=new_log_probs.device)
+        return None, empty, empty, None
 
+    max_response_len = max(response_lengths)
+    batch_size = len(response_lengths)
+    device = new_log_probs.device
 
-    old_log_probs_tensor = torch.zeros(
-        len(expanded_old_log_probs),
-        max_response_len,
-        dtype=torch.bfloat16,
-        device="cuda"
+    new_log_probs_resp = torch.zeros(
+        (batch_size, max_response_len),
+        dtype=new_log_probs.dtype,
+        device=device,
     )
 
-    response_mask = torch.zeros_like(old_log_probs_tensor, dtype=torch.bfloat16, device="cuda")
-    
+    response_mask = torch.zeros(
+        (batch_size, max_response_len),
+        dtype=torch.bfloat16,
+        device=device,
+    )
 
-    for i, (seq, resp_len) in enumerate(zip(expanded_old_log_probs, response_len)):
-        old_log_probs_tensor[i, -resp_len:] = torch.tensor(seq, dtype=torch.bfloat16, device="cuda")
-        response_mask[i, -resp_len:] = 1.0
-    
-    new_lpg_probs_resp = torch.zeros_like(old_log_probs_tensor)
-    for i, resp_len in enumerate(response_len):
-        new_lpg_probs_resp[i, -resp_len:] = new_log_probs[i, -resp_len:]
-    
-    token_entropy_resp = torch.zeros_like(old_log_probs_tensor)
-    for i, resp_len in enumerate(response_len):
-        token_entropy_resp[i, -resp_len:] = token_entropy[i, -resp_len:]
-    masked_entropy = (token_entropy_resp * response_mask).sum() / response_mask.sum().clamp_min(1e-8)
-        
-    return old_log_probs_tensor, response_mask, new_lpg_probs_resp, masked_entropy
+    token_entropy_resp = None
+    if token_entropy is not None:
+        token_entropy_resp = torch.zeros(
+            (batch_size, max_response_len),
+            dtype=token_entropy.dtype,
+            device=device,
+        )
+
+
+    for i, resp_len in enumerate(response_lengths):
+        if resp_len == 0:
+            continue
+        start = max_response_len - resp_len
+        response_mask[i, start:] = 1.0
+        new_log_probs_resp[i, start:] = new_log_probs[i, -resp_len:]
+        if token_entropy_resp is not None:
+            token_entropy_resp[i, start:] = token_entropy[i, -resp_len:]
+
+    masked_entropy = None
+    if token_entropy_resp is not None:
+        masked_entropy = (token_entropy_resp * response_mask).sum() / response_mask.sum().clamp_min(1e-8)
+
+    return response_mask, new_log_probs_resp, masked_entropy
 
 
 
@@ -447,4 +464,4 @@ def build_dataloader(dataset, batch_size):
     gen.manual_seed(2025)                     # 固定种子
     sampler = RandomSampler(dataset, generator=gen)
     return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
-                      num_workers=24, pin_memory=True, persistent_workers=True)
+                      num_workers=8, pin_memory=True, persistent_workers=True)
