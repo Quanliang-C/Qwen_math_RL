@@ -4,6 +4,10 @@ import os
 # # 这可能会导致轻微的“off policy”问题，但目前看来影响不大
 # os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+## 关掉避免illegal memory access
+os.environ["VLLM_USE_FLASHINFER_SAMPLER"] = "0"
+os.environ["VLLM_DISABLE_FLASHINFER"] = "1"
+os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
 from grpo_utility import *
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
@@ -21,7 +25,7 @@ import random
 import wandb
 import bitsandbytes as bnb
 from itertools import islice
-from collections import deque
+
 
 
 
@@ -33,9 +37,9 @@ LOCAL_SNAPSHOT = snapshot_download(
 )
 
 n_grpo_steps = 300
-learning_rate = 4e-5
+learning_rate = 1e-5
 warmup_steps = 10
-lr_min = 2e-5
+lr_min = 5e-6
 advantage_eps = 1e-6
 sampling_min_tokens = 0
 sampling_max_tokens = 512
@@ -50,22 +54,23 @@ group_size = 8
 ## 目前的逻辑是这样的，仅为暂时的
 num_optimizer_steps = n_grpo_steps * epoch_per_rollout_batch
 
-model_version = "v4_L4_tried4"
+model_version = "v7_L4"
 
 
 use_std_normalization = False
 
-grpo_clip_range = 0.20
+grpo_clip_range = 0.30
 
-### 断点需要注意,id, 模型，优化器，lr scheduler等都要一致, 要设置start_train_step, 现在暂时是错误的
+### 断点需要注意,id, 模型，优化器，lr scheduler等都要一致, 要设置start_train_step
+## 记得修改id
 start_train_step = 1
 Load_From_Checkpoint = False
-checkpoint_dir = "grpo_checkpoint/reinforce_with_baseline/v2_50"
+checkpoint_dir = "grpo_checkpoint/grpo_clip/v4_L4_tried4_60"
 if Load_From_Checkpoint:
     wandb.init(
     project="grpo",
     name=f"grpo_{loss_type}_{model_version}",
-    id="ysmj6ogo",
+    id="rm4mfk3m",
     resume="allow",
     config={
         "loss_type": loss_type,
@@ -103,12 +108,23 @@ wandb.log({}, commit=True)
 
 
 def main():
-    random.seed(88)
-    np.random.seed(88)
-    torch.manual_seed(88)
-    torch.cuda.manual_seed_all(88)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if Load_From_Checkpoint:
+        resume_state = load_trainer_state(checkpoint_dir)
+        rng = resume_state.get("rng")
+        if rng:
+            random.setstate(rng["python"])
+            np.random.set_state(rng["numpy"])
+            torch.set_rng_state(rng["torch_cpu"])
+            torch.cuda.set_rng_state_all(rng["torch_cuda"])
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    else:
+        random.seed(88)
+        np.random.seed(88)
+        torch.manual_seed(88)
+        torch.cuda.manual_seed_all(88)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     ## 64 % 64 == 0
     # assert train_batch_size % gradient_accumulation_steps == 0, (
     #     "train_batch_size must be divisible by gradient_accumulation_steps"
@@ -161,7 +177,7 @@ def main():
     dataloader_iter = iter(dataloader)
     skip = (start_train_step-1) % len(dataloader)
     dataloader_iter = islice(dataloader_iter, skip, None)
-    batch = next(dataloader_iter)
+    # batch = next(dataloader_iter)
 
 
 
@@ -198,16 +214,11 @@ def main():
                 betas=(0.9, 0.95),
                 weight_decay=0.0)
             scheduler = build_scheduler(optimizer, warmup_steps, n_grpo_steps*epoch_per_rollout_batch, lr_min)
-            resume_state = load_trainer_state(checkpoint_dir)
+            # resume_state = load_trainer_state(checkpoint_dir)
             optimizer.load_state_dict(resume_state["optimizer"])
             scheduler.load_state_dict(resume_state["scheduler"])
             optimizer_step = resume_state["optimizer_step"]
-            rng = resume_state.get("rng")
-            if rng:
-                random.setstate(rng["python"])
-                np.random.set_state(rng["numpy"])
-                torch.set_rng_state(rng["torch_cpu"])
-                torch.cuda.set_rng_state_all(rng["torch_cuda"])
+
             
             print(f"[RESUME] from {checkpoint_dir}, start_train_step={start_train_step}, optimizer_step={optimizer_step}")
 
@@ -313,7 +324,7 @@ def main():
 
 
                 response_lengths = len_token_ids[j:j+micro_train_batch_size]
-                
+
 
 
                 response_mask, new_lpg_probs_resp, masked_token_entropy = get_response_log_probs_tensor_and_response_mask(
