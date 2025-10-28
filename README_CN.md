@@ -2,7 +2,7 @@
 
 本仓库实现了一个用于数学推理任务的强化学习训练与评估系统，目标是验证小参数推理模型 **Qwen2.5-Math-1.5B** 是否可以仅依靠可验证奖励（verified reward），在不依赖闭源 Reward Model、不依赖教师大模型蒸馏的情况下，显著提升数学推理正确率与推理链质量。
 
-在严格的 0-shot 评测设定下（输出格式和最终数值必须同时正确），该系统将同一 base model 的 pass@1 accuracy 从约 **5.4%** 提升到约 **82% ~ 87%**，显著超过更大规模的开源推理模型（例如 Llama-3.1-8B-Instruct 约 41%，Qwen3-8B thinking 模式约 15%，deepseek-math-7b-rl 约 1.1%）。
+在严格的 0-shot 评测设定下（输出格式和最终数值必须同时正确），该系统将同一 base model 的 pass@1 accuracy 从约 **5.4%** 提升到约 **83% ~ 87%**，显著超过更大规模的开源推理模型（例如 Llama-3.1-8B-Instruct 约 41%，Qwen3-8B thinking 模式约 15%，deepseek-math-7b-rl 约 1.1%）。
 
 > 说明：本项目最初以 Stanford CS336 Assignment 5 为起点，仅复用了基础测试脚本与若干启动流程。核心强化学习管线、策略优化逻辑、优势函数设计、显存适配、断点恢复、监控与可复现性均为独立实现。
 
@@ -81,13 +81,13 @@ Assistant:
 
 * 对同一题目的多条回答形成一个“组”（group）。
 
-* 组内计算 baseline：`b = mean(reward_i)`，即该组平均奖励。
+* 组内计算 $baseline：b = mean(reward_i)$ ，即该组平均奖励。
 
 * 每条样本获得优势值：
-
-  [
+  
+ $$
   A_i = reward_i - b
-  ]
+ $$
 
 * 和常见 RLHF 里的做法不同：
 
@@ -119,23 +119,28 @@ Assistant:
 
 ---
 
-## 3. 策略梯度目标：REINFORCE+baseline 与 Dr GRPO
+## 3. 策略梯度目标：REINFORCE+baseline 与 GRPO / Dr GRPO
 
-系统实现并比较了两种主要的策略优化方法。两者都使用上面定义的二元奖励（0/1），区别在于稳定性控制方式。
+系统实现并比较了三类更新规则：
+* 经典 REINFORCE+baseline（无 ratio clipping），
+* 原始 GRPO 公式，
+* Dr GRPO（我们最终采用的变体）。
+
+这三者都使用同一个奖励定义（0/1 verified reward），区别在于梯度如何约束、是否对样本再加额外缩放。
 
 ### 3.1 REINFORCE + baseline
 
 对第 (i) 条样本，记：
 
-* `reward_i`：`r1_zero_reward_fn` 给出的 0/1 奖励
-* `b`：该题目组的平均奖励
-* `A_i = reward_i - b`
+* $reward_i$：$r1_zero_reward_fn$ 给出的 0/1 奖励
+* $b$：该题目组的平均奖励
+* $A_i = reward_i - b$
 
 定义目标（最小化的 loss）为经典 REINFORCE 形式：
 
-[
-L_{\text{reinforce}}(\theta) = - \mathbb{E}*i \left[ A_i \cdot \log \pi*\theta(i) \right]
-]
+$$
+L_{\mathrm{REINFORCE}}(\theta) = - \mathbb{E}_{i}\left[ A_i \log \pi_{\theta}(i) \right]
+$$
 
 解释：
 
@@ -151,9 +156,50 @@ L_{\text{reinforce}}(\theta) = - \mathbb{E}*i \left[ A_i \cdot \log \pi*\theta(i
 
 在实践中，这个变体在大约 200 个 on-policy update step 后，可以把严格 0-shot pass@1 accuracy 提升到约 **87%**。
 
-### 3.2 Dr GRPO（GRPO 变种）
+### 3.2 原版 GRPO 公式
+
+公开的 GRPO（Group Relative Policy Optimization）可以看作是把 PPO-Clip 的思想用在“同一题目的多条候选回答”上。设同一题目的第 i 条完整回答为 o_i，其第 t 个 token 为 o_{i,t}，问题是 q。把同一题采样到的所有回答写成 {o_1, ..., o_G}。对该题定义组大小为 G。
+
+GRPO 的目标（写成要最小化的 loss 的负号形式）可以表示为：
+
+$$
+\mathcal{L}_{\mathrm{GRPO\text{-}Clip}}(\theta)
+= - \frac{1}{G} \sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|}
+\min\\bigl(
+  r_{i,t}(\theta)\,\hat{A}_{i,t},\;
+  \mathrm{clip}\bigl(r_{i,t}(\theta),\,1-\varepsilon,\,1+\varepsilon\bigr)\,\hat{A}_{i,t}
+\bigr)
+$$
+
+其中:
+
+$$
+r_{i,t}(\theta)
+= \frac{\pi_{\theta}\bigl(o_{i,t}\mid q,\,o_{i,\lt t}\bigr)}
+       {\pi_{\theta_{\mathrm{old}}}\bigl(o_{i,t}\mid q,\,o_{i,\lt t}\bigr)}
+$$
+
+$$
+\hat{A}_{i,t}
+= \frac{
+  R(q, o_i) - \mathrm{mean}\!\bigl(\{ R(q, o_1), \ldots, R(q, o_G) \}\bigr)
+}{
+  \mathrm{std}\!\bigl(\{ R(q, o_1), \ldots, R(q, o_G) \}\bigr)
+}
+$$
+
+两个重要特性：
+
+* Token-length weighting
+外层有一个 $\frac{1}{|o_i|}$ 。也就是说，回答越长，单个 token 的梯度越被平均，等价于“把一条长回答的总权重分摊到它的所有 token 上”。这会让长回答在整体上被“均摊”，而短回答在整体上被“放大”。
+
+* Std normalization
+$\hat{A}_{i,t}$ 使用了组内奖励的标准差 std(...) 进行归一化。也就是把 (reward_i - 平均奖励) 除以组内标准差。直观上，这是在做一个“z-score 标准化”，目的是放大当前 batch 里相对更好的回答并抑制方差。
+
+### 3.3 Dr GRPO（GRPO 变种）
 
 Dr GRPO 的思想与 GRPO 类似：使用比值裁剪（ratio clipping）控制单步更新幅度，接近 PPO/PPO-Clip 风格的稳定性约束。
+Dr GRPO 移除了上面两个会放大偏置的因素，得到的公式是：
 
 记：
 
@@ -163,29 +209,48 @@ Dr GRPO 的思想与 GRPO 类似：使用比值裁剪（ratio clipping）控制�
 
 * 概率比：
 
-  [
+$$
   r_i = \exp(\log \pi_\theta(i) - \log \pi_{\text{old}}(i))
   ]
+$$
 
-* 同样我们有 (A_i = reward_i - b)，与 REINFORCE 一致，不做 std-normalization。
+* 同样我们有 ($A_i = reward_i - b$)，与 REINFORCE 一致，不做 std-normalization。
 
 Dr GRPO 的目标函数（最小化的 loss）采用裁剪后的 surrogate：
 
-[
-L_{\text{drgrpo}}(\theta)
-= - \mathbb{E}_i \left[
-\min \Big(
-r_i \cdot A_i,;
-\text{clip}(r_i,;1-\epsilon,;1+\epsilon) \cdot A_i
-\Big)
-\right]
-]
+$$
+L(\theta)
+= \frac{1}{G} \sum_{i=1}^{G} \sum_{t=1}^{|o_i|}
+\min\bigl(
+  \frac{\pi_{\theta}(o_{i,t} \mid q,\, o_{i,\lt t})}{\pi_{\theta_{\mathrm{old}}}(o_{i,t} \mid q,\, o_{i,\lt t})} \,\hat{A}_{i,t},
+  \mathrm{clip}\bigl(
+    \frac{\pi_{\theta}(o_{i,t} \mid q,\, o_{i,\lt t})}{\pi_{\theta_{\mathrm{old}}}(o_{i,t} \mid q,\, o_{i,\lt t})},
+    1-\varepsilon,\,
+    1+\varepsilon
+  \bigr)\,\hat{A}_{i,t}
+\bigr)
+$$
 
-其中 (\epsilon) 是一个固定的 clip range（本实验中约为 `0.30`）。
+其中:
+
+$$
+\hat{A}_{i,t}
+= R(q, o_i) - \mathrm{mean}\bigl( R(q, o_1), \ldots, R(q, o_G) \bigr)
+$$
+
+
+
+其中 $\epsilon$ 是一个可以调节的的 clip range（本实验中最后选择为 `0.30`）。
 直观理解：
 
 * 当新策略试图“过度推高”某条回答的概率时（即 (r_i) 偏离 1 太多），clip 会限制更新力度，避免单步过拟合。
-* 这与 PPO/PPO-Clip 的思想类似，也与公开的 GRPO 框架同属一类比值裁剪思路。
+
+区别与 GRPO 非常明确：
+
+* 我们不再用 $\frac{1}{|o_i|}$ 去缩放一条回答内部所有 token 的权重。一定程度上抑制了回答变长的趋势。
+
+不再除以组内标准差 std
+$\hat{A}_{i,t}$ 只是简单的 reward_i - mean_reward，而不是 z-score。这样可以避免在小 batch 下由于标准差太小而把极少数高分回答的权重放大到不稳定的程度，也避免 reward=0/1 这种离散信号被“硬性拉伸”。
 
 训练细节：
 
@@ -194,15 +259,40 @@ r_i \cdot A_i,;
 
 实验结果：
 
-* Dr GRPO 在同等训练步数下可收敛到约 **82%** pass@1 accuracy。
+* Dr GRPO 在同等训练步数下可收敛到约 **83%** pass@1 accuracy。
 * 虽然略低于 REINFORCE+baseline (~87%)，但在扩大 batch（例如从 ~1.6k 样本到 ~6.4k 样本）和迁移到高算力 GPU（H200）时，Dr GRPO 的训练更平滑、更可控。
 * 我们在此过程中同样没有额外 KL penalty、没有 entropy bonus，稳定性完全来自 clip 和适度学习率。
 
-### 3.3 对比总结
+
+### 3.4 消融实验：为什么我们最终采用 Dr GRPO
+
+我们针对 GRPO 系列做了 4 组消融，分别关闭不同的缩放项，观察稳定性和最终准确率：
+
+* 原版 GRPO
+同时保留 token-length weighting $\frac{1}{|o_i|}$ 和 std normalization (/ std(...))。
+
+* GRPO 去掉 std normalization
+保留 token-length weighting，但把 $\hat{A}_{i,t}$ 改成 reward_i - mean_reward，即不再除以组内标准差。
+
+* GRPO 去掉 token-length weighting
+去掉外层的 $\frac{1}{|o_i|}$ ，但仍使用 z-score 风格的 (reward_i - mean_reward) / std(...)。
+
+* Dr GRPO（两者都去掉）
+既不对长回答做 $\frac{1}{|o_i|}$ 的均摊，也不做标准差归一化。也就是 3.3 节给出的公式。
+
+最终我们选用了Dr GRPO进行进一步的实验，Dr GRPO在回答长度抑制方面表现更优秀，以及训练会更稳，batch 间不会因为极少数高分回答而出现巨大梯度尖峰，能更好的利用奖励信息。
+
+结合 3.1 节的 REINFORCE+baseline（无 clip，单次更新幅度更大），我们最终保留了两条训练路径：
+
+* REINFORCE+baseline：在较小算力、较小 batch 下可以最快把准确率推高到 ~87%。
+
+* Dr GRPO：在较大算力和大吞吐 rollout 下仍保持稳定，达到 ~83%，并且更容易规模化。
+
+### 3.5 对比总结
 
 * 两种方法使用的是同一 reward 定义，reward 完全可自动判定。
 * REINFORCE+baseline 在 200 步内冲到最高准确率（~87%）。
-* Dr GRPO 提供一个更接近工业 PPO/GRPO 范式的更新流程，在更大 rollout/更高吞吐时仍保持训练稳定，达到 ~82%。
+* Dr GRPO 提供一个更接近工业 PPO/GRPO 范式的更新流程，在更大 rollout/更高吞吐时仍保持训练稳定，达到 ~83%。
 
 这说明在一个 1.5B 参数量级的数学推理模型上，纯粹依靠 verified reward + 策略梯度（无RM、无teacher）就能显著提升推理能力。
 
@@ -210,7 +300,7 @@ r_i \cdot A_i,;
 
 ## 4. 资源效率与扩展性
 
-该系统专门针对“我只有一块中等显存卡，但我仍想做 RL”的现实情况进行优化，同时也支持迁移到高带宽 GPU。
+该系统专门针对“低计算资源但仍然想尝试RL”的现实情况进行优化，同时也支持迁移到高带宽 GPU。
 
 * **单卡 L4 (24GB)**
 
@@ -236,9 +326,10 @@ r_i \cdot A_i,;
 | ---------------------------- | --------------- | ------------------- | -------------------------------- |
 | Qwen2.5-Math-1.5B (原始)       | ~5.4%           | -                   | 严格 0-shot 基线                     |
 | REINFORCE+baseline (本系统)     | ~87%            | ~200 on-policy step | 无 KL/entropy 正则，仅靠组内 baseline 优势 |
-| Dr GRPO / clipped GRPO (本系统) | ~82%            | ~200 step           | ratio clipping (clip≈0.30)，更稳但略低 |
+| Dr GRPO / clipped GRPO (本系统) | ~83%            | ~200 step           | ratio clipping (clip≈0.30)，更稳但略低 |
 | Llama-3.1-8B-Instruct        | ~41.3%          | -                   | 同一评测脚本下                          |
 | Qwen3-8B (thinking 模式)       | ~14.9%          | -                   | 同一评测脚本下                          |
+
 说明：
 
 * 所有对比模型都在“同一评测脚本、同一严格标准”下评测。
@@ -257,7 +348,7 @@ r_i \cdot A_i,;
 * `eval_metrics/*`：定期对 GSM8K test split 的 pass@1 accuracy；
 * `optimizer/*`：学习率、梯度范数等。
 
-示意图（占位）：
+下面为Token entropy随优化步的变化以及GSM8k Test集的随训练步变化的表现：
 
 ![Token entropy](./figure/tokenentropy.png)
 *图 1：token-level entropy 随训练步数的变化，用于监控模型是否在过早坍缩为“固定模版式回答”。*
