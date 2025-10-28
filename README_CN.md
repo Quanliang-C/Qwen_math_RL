@@ -1,8 +1,10 @@
+[English](README.md) | 简体中文
+
 # GSM8K 数学推理强化学习系统（Qwen2.5-Math-1.5B）
 
 本仓库实现了一个用于数学推理任务的强化学习训练与评估系统，目标是验证小参数推理模型 **Qwen2.5-Math-1.5B** 是否可以仅依靠可验证奖励（verified reward），在不依赖闭源 Reward Model、不依赖教师大模型蒸馏的情况下，显著提升数学推理正确率与推理链质量。
 
-在严格的 0-shot 评测设定下（输出格式和最终数值必须同时正确），该系统将同一 base model 的 pass@1 accuracy 从约 **5.4%** 提升到约 **83% ~ 87%**，显著超过更大规模的开源推理模型（例如 Llama-3.1-8B-Instruct 约 41%，Qwen3-8B thinking 模式约 15%，deepseek-math-7b-rl 约 1.1%）。
+在严格的 0-shot 评测设定下（输出格式和最终数值必须同时正确），该系统将同一 base model 的 pass@1 accuracy 从约 **5.4%** 提升到约 **83% ~ 87%**，显著超过更大规模的开源推理模型（例如 Llama-3.1-8B-Instruct 约 41%，Qwen3-8B thinking 模式约 15%）。
 
 > 说明：本项目最初以 Stanford CS336 Assignment 5 为起点，仅复用了基础测试脚本与若干启动流程。核心强化学习管线、策略优化逻辑、优势函数设计、显存适配、断点恢复、监控与可复现性均为独立实现。
 
