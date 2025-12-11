@@ -287,13 +287,14 @@ The system is optimized for low-resource RL while supporting migration to high-b
 
 ---
 
-## 5. Experimental results (GSM8K test split, strict zero-shot)
+## 5.1 Experimental results (GSM8K test split, strict zero-shot)
 
 | Training strategy / model                 | pass@1 Accuracy | Training steps           | Notes                                               |
 | ---------------------------------------- | --------------- | ------------------------ | --------------------------------------------------- |
 | Qwen2.5‑Math‑1.5B (base)                 | ~5.4%           | –                        | Strict zero-shot baseline                           |
 | REINFORCE+baseline (this system)         | ~87%            | ~200 on-policy steps     | No KL/entropy regularizers; relies on group baseline |
 | Dr GRPO / clipped GRPO (this system)     | ~83%            | ~200 steps               | Ratio clipping (clip≈0.30); more stable, slightly lower |
+| Qwen2.5-Math-7B (base)       | ~6.1%           | -                   | Measured under the same evaluation script                 |
 | Llama‑3.1‑8B‑Instruct                     | ~41.3%          | –                        | Measured under the same evaluation script           |
 | Qwen3‑8B (thinking mode)                  | ~14.9%          | –                        | Measured under the same evaluation script           |
 
@@ -304,6 +305,63 @@ Notes:
 - Therefore, the reported accuracies are directly comparable under identical conditions.
 
 ---
+
+
+## 5.2 Experimental results（GSM8K test split, Non-Strict Parser 0-shot）
+
+| Training strategy / model                 | pass@1 Accuracy | Training steps           | Notes                                               |
+| ---------------------------- | --------------- | ------------------- | -------------------------------- |
+| Qwen2.5-Math-1.5B (base)       | ~30.5%           | -                   | 0-shot baseline                     |
+| REINFORCE+baseline (this system)     | ~89%            | ~200 on-policy step | No KL/entropy regularizers; relies on group baseline |
+| Dr GRPO / clipped GRPO (this system) | ~84%            | ~200 step           | Ratio clipping (clip≈0.30); more stable, slightly lower |
+| Qwen2.5-Math-7B (base)       | ~64.7%           | -                   |  Measured under the same evaluation script                    |
+| Llama-3.1-8B-Instruct        | ~48.9%          | -                   |  Measured under the same evaluation script                          |
+| Qwen3-8B (thinking mode)       | ~82.2%          | -                   |  Measured under the same evaluation script                       |
+
+Notes：
+
+* All models are evaluated under the same script and Non-strict criteria.
+* Natural language answer and Non-JSON answer are allowed
+
+---
+
+
+## 5.3 Experimental results (MATH500, strict zero-shot)
+
+| Training strategy / model                 | pass@1 Accuracy | Training steps           | Notes                                               |
+| ---------------------------------------- | --------------- | ------------------------ | --------------------------------------------------- |
+| Qwen2.5‑Math‑1.5B (base)                 | ~4.6%           | –                        | Strict zero-shot baseline                           |
+| REINFORCE+baseline (this system)         | ~67.8%            | ~200 on-policy steps     | No KL/entropy regularizers; relies on group baseline |
+| Qwen2.5-Math-7B (base)       | ~2.8%           | -                   | Measured under the same evaluation script                 |
+| Llama‑3.1‑8B‑Instruct                     | ~14.4%          | –                        | Measured under the same evaluation script           |
+| Qwen3‑8B (thinking mode)                  | ~21.4%          | –                        | Measured under the same evaluation script           |
+
+Notes:
+
+- All models are evaluated under the same script and strict criteria.
+- The evaluation requires both the correct format and the correct numeric answer; free-form textual answers or “nearly correct” outputs are counted as incorrect.
+- Therefore, the reported accuracies are directly comparable under identical conditions.
+
+---
+
+
+
+## 5.4 Experimental results（MATH500, Non-Strict Parser 0-shot）
+
+| Training strategy / model                 | pass@1 Accuracy | Training steps           | Notes                                               |
+| ---------------------------- | --------------- | ------------------- | -------------------------------- |
+| Qwen2.5-Math-1.5B (base)       | ~23.2%           | -                   | 0-shot baseline                     |
+| REINFORCE+baseline (this system)     | ~69.6%            | ~200 on-policy step | No KL/entropy regularizers; relies on group baseline |
+| Qwen2.5-Math-7B (base)       | ~57.2%           | -                   |  Measured under the same evaluation script                    |
+| Llama-3.1-8B-Instruct        | ~22.8%          | -                   |  Measured under the same evaluation script                          |
+| Qwen3-8B (thinking mode)       | ~67.4%          | -                   |  Measured under the same evaluation script                       |
+
+Notes：
+
+* All models are evaluated under the same script and Non-strict criteria.
+* Natural language answer and Non-JSON answer are allowed
+
+
 
 ## 6. Training monitoring and visualization
 
